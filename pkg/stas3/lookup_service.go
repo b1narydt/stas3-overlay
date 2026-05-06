@@ -18,7 +18,8 @@ import (
 )
 
 // LookupService indexes admitted STAS v3 token UTXOs in MongoDB and answers
-// queries by tokenId, address, and spent status.
+// queries by all standard STAS3 fields plus the universal class_hash,
+// action_kind, and swap descriptor projections.
 type LookupService struct {
 	col *mongo.Collection
 }
@@ -46,6 +47,26 @@ func (ls *LookupService) EnsureIndexes(ctx context.Context) error {
 		},
 		{
 			Keys: bson.D{{Key: "tokenId", Value: 1}, {Key: "address", Value: 1}, {Key: "spent", Value: 1}},
+		},
+		// Universal cross-overlay routing key. Indexing it lets clients
+		// confirm "this overlay actually serves the class I expect" and
+		// is the basis for cross-overlay swap discovery.
+		{
+			Keys: bson.D{{Key: "classHash", Value: 1}, {Key: "spent", Value: 1}},
+		},
+		// Action-data projections.
+		{
+			Keys: bson.D{{Key: "actionKind", Value: 1}, {Key: "spent", Value: 1}},
+		},
+		// Swap-discovery composite. A taker on a GOLD overlay finds
+		// inbound USD offers by querying any USD overlay for
+		// swapRequestedScriptHash == H_GOLD.
+		{
+			Keys: bson.D{
+				{Key: "actionKind", Value: 1},
+				{Key: "swapRequestedScriptHash", Value: 1},
+				{Key: "spent", Value: 1},
+			},
 		},
 	}
 	_, err := ls.col.Indexes().CreateMany(ctx, indexes)
@@ -81,13 +102,28 @@ func (ls *LookupService) OutputAdmittedByTopic(ctx context.Context, payload *eng
 	}
 
 	record := STASRecord{
-		TxID:     txid.String(),
-		Vout:     idx,
-		TokenID:  parsed.TokenID,
-		Address:  parsed.Address,
-		Symbol:   parsed.Symbol,
-		Satoshis: out.Satoshis,
-		IsDSTAS:  parsed.IsDSTAS,
+		TxID:                  txid.String(),
+		Vout:                  idx,
+		TokenID:               parsed.TokenID,
+		Address:               parsed.Address,
+		Symbol:                parsed.Symbol,
+		Satoshis:              out.Satoshis,
+		IsDSTAS:               parsed.IsDSTAS,
+		ClassHash:             parsed.ClassHash,
+		ActionKind:            parsed.ActionKind,
+		Frozen:                parsed.Frozen,
+		ActionData:            parsed.ActionData,
+		Flags:                 parsed.Flags,
+		FreezeAuthority:       parsed.FreezeAuthority,
+		ConfiscationAuthority: parsed.ConfiscationAuthority,
+		OptionalData:          parsed.OptionalData,
+	}
+	if parsed.SwapDescriptor != nil {
+		record.SwapRequestedScriptHash = parsed.SwapDescriptor.RequestedScriptHash
+		record.SwapRequestedPkh = parsed.SwapDescriptor.RequestedPkh
+		record.SwapRateNumerator = parsed.SwapDescriptor.RateNumerator
+		record.SwapRateDenominator = parsed.SwapDescriptor.RateDenominator
+		record.SwapHasNext = parsed.SwapDescriptor.HasNext
 	}
 
 	filter := bson.M{"txid": record.TxID, "vout": record.Vout}
@@ -99,8 +135,8 @@ func (ls *LookupService) OutputAdmittedByTopic(ctx context.Context, payload *eng
 	slog.Info("ls_stas3: indexed output",
 		"outpoint", fmt.Sprintf("%s:%d", record.TxID, record.Vout),
 		"tokenId", record.TokenID,
-		"address", record.Address,
-		"symbol", record.Symbol,
+		"classHash", record.ClassHash,
+		"actionKind", record.ActionKind,
 		"satoshis", record.Satoshis,
 	)
 
@@ -151,18 +187,17 @@ func (ls *LookupService) Lookup(ctx context.Context, question *lookup.LookupQues
 		return nil, fmt.Errorf("ls_stas3: parsing query: %w", err)
 	}
 
-	filter := bson.M{}
-	if q.TokenID != "" {
-		filter["tokenId"] = q.TokenID
+	filter := buildLookupFilter(&q)
+
+	findOpts := options.Find()
+	if q.Limit > 0 {
+		findOpts.SetLimit(q.Limit)
 	}
-	if q.Address != "" {
-		filter["address"] = q.Address
-	}
-	if q.UnspentOnly {
-		filter["spent"] = false
+	if q.Skip > 0 {
+		findOpts.SetSkip(q.Skip)
 	}
 
-	cursor, err := ls.col.Find(ctx, filter)
+	cursor, err := ls.col.Find(ctx, filter, findOpts)
 	if err != nil {
 		return nil, fmt.Errorf("ls_stas3: querying MongoDB: %w", err)
 	}
@@ -186,9 +221,7 @@ func (ls *LookupService) Lookup(ctx context.Context, question *lookup.LookupQues
 	}
 
 	slog.Info("ls_stas3: lookup",
-		"query_tokenId", q.TokenID,
-		"query_address", q.Address,
-		"query_unspentOnly", q.UnspentOnly,
+		"filter", filter,
 		"result_count", len(records),
 	)
 
@@ -206,11 +239,53 @@ func (ls *LookupService) Lookup(ctx context.Context, question *lookup.LookupQues
 	}, nil
 }
 
+// buildLookupFilter translates a STASQuery into a Mongo filter document.
+// Empty fields are omitted so the filter only constrains explicit values.
+// Extracted to allow unit-testing the query semantics independently of the
+// Mongo driver.
+func buildLookupFilter(q *STASQuery) bson.M {
+	filter := bson.M{}
+	if q.TokenID != "" {
+		filter["tokenId"] = q.TokenID
+	}
+	if q.Address != "" {
+		filter["address"] = q.Address
+	}
+	if q.UnspentOnly {
+		filter["spent"] = false
+	}
+	if q.ClassHash != "" {
+		filter["classHash"] = q.ClassHash
+	}
+	if q.ActionKind != "" {
+		filter["actionKind"] = q.ActionKind
+	}
+	if q.FrozenOnly {
+		filter["frozen"] = true
+	}
+	if q.SwapRequestedScriptHash != "" {
+		filter["swapRequestedScriptHash"] = q.SwapRequestedScriptHash
+	}
+	if q.SwapRequestedPkh != "" {
+		filter["swapRequestedPkh"] = q.SwapRequestedPkh
+	}
+	if q.TxID != "" {
+		filter["txid"] = q.TxID
+	}
+	if q.Vout != nil {
+		filter["vout"] = *q.Vout
+	}
+	return filter
+}
+
 func (ls *LookupService) GetDocumentation() string {
 	return "STAS v3 token lookup service. " +
-		"Indexes STAS v3 token UTXOs and answers queries " +
-		"by tokenId, address, and spent status. " +
-		"Returns token records with satoshis, symbol, and block height."
+		"Indexes STAS v3 UTXOs and exposes filters by tokenId, address, " +
+		"classHash, actionKind, swapRequestedScriptHash, swapRequestedPkh, " +
+		"frozenOnly, unspentOnly, txid+vout. " +
+		"Records carry the universal classHash and full action_data + " +
+		"swap descriptor projections so apps can match cross-class swap " +
+		"offers without further parsing."
 }
 
 func (ls *LookupService) GetMetaData() *overlay.MetaData {
