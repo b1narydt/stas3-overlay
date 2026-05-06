@@ -53,6 +53,11 @@ type STASRecord struct {
 	// ActionData is the raw push bytes (hex) for apps that need fields
 	// beyond the typed surface (e.g. chained swap legs, custom kinds).
 	ActionData string `bson:"actionData,omitempty" json:"actionData,omitempty"`
+	// ActionRecordPayload is the bytes AFTER the selector for
+	// confiscation / freeze / custom kinds (hex). Empty for swap and
+	// the passive / frozen-empty kinds. Lets apps decode SDK-specific
+	// authority records without re-parsing.
+	ActionRecordPayload string `bson:"actionRecordPayload,omitempty" json:"actionRecordPayload,omitempty"`
 
 	// --- swap descriptor (set when ActionKind=="swap" or frozen-swap) ---
 	SwapRequestedScriptHash string `bson:"swapRequestedScriptHash,omitempty" json:"swapRequestedScriptHash,omitempty"`

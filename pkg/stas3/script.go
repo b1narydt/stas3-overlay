@@ -53,9 +53,13 @@ type STASOutput struct {
 	// ActionData is the raw push bytes (hex). Apps that need more than
 	// the typed fields above can re-decode from here.
 	ActionData string
-	// SwapDescriptor is set when ActionKind == "swap" (or for frozen
-	// UTXOs whose inner action_data is a swap leg).
+	// SwapDescriptor is set when ActionKind == "swap".
 	SwapDescriptor *SwapDescriptor
+	// ActionRecordPayload is the bytes after the selector for
+	// confiscation / freeze / custom action records (hex-encoded). Empty
+	// for swap and passive/frozen-empty kinds. Apps decode these
+	// SDK-defined inner structures themselves.
+	ActionRecordPayload string
 	// Flags is the protocol flag byte (bit 0 = freezable, bit 1 = confiscatable).
 	Flags uint8
 	// FreezeAuthority is the 20-byte hash160 of the freeze authority
@@ -169,7 +173,7 @@ func parseDSTAS(b []byte) (*STASOutput, error) {
 		return nil, ErrNotSTAS
 	}
 	actionPayload := extractPushPayload(b, actionStart, actionEnd)
-	actionKind, frozen, swap := decodeActionData(actionPayload, actionByte)
+	actionKind, frozen, swap, actionRecordPayload := decodeActionData(actionPayload, actionByte)
 
 	// Verify there's a covenant body between action data and OP_RETURN.
 	// The DSTAS template base is substantial (hundreds of bytes).
@@ -208,6 +212,9 @@ func parseDSTAS(b []byte) (*STASOutput, error) {
 		Frozen:         frozen,
 		ActionData:     hex.EncodeToString(actionPayload),
 		SwapDescriptor: swap,
+	}
+	if len(actionRecordPayload) > 0 {
+		out.ActionRecordPayload = hex.EncodeToString(actionRecordPayload)
 	}
 
 	// Flags byte (push #2 after OP_RETURN). When absent, treat as 0

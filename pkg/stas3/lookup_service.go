@@ -113,6 +113,7 @@ func (ls *LookupService) OutputAdmittedByTopic(ctx context.Context, payload *eng
 		ActionKind:            parsed.ActionKind,
 		Frozen:                parsed.Frozen,
 		ActionData:            parsed.ActionData,
+		ActionRecordPayload:   parsed.ActionRecordPayload,
 		Flags:                 parsed.Flags,
 		FreezeAuthority:       parsed.FreezeAuthority,
 		ConfiscationAuthority: parsed.ConfiscationAuthority,

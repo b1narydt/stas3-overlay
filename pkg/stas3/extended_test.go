@@ -103,7 +103,7 @@ func TestClassHash_DeterministicAcrossCalls(t *testing.T) {
 
 // TestDecodeActionData_Passive checks the bare OP_0 / empty payload case.
 func TestDecodeActionData_Passive(t *testing.T) {
-	kind, frozen, swap := decodeActionData(nil, opFALSE)
+	kind, frozen, swap, payload := decodeActionData(nil, opFALSE)
 	if kind != ActionKindPassive {
 		t.Errorf("OP_0 should be passive, got %s", kind)
 	}
@@ -113,11 +113,15 @@ func TestDecodeActionData_Passive(t *testing.T) {
 	if swap != nil {
 		t.Errorf("OP_0 should have no swap descriptor")
 	}
+	if payload != nil {
+		t.Errorf("passive should have no action-record payload")
+	}
 }
 
-// TestDecodeActionData_FrozenOpcode checks bare OP_2.
+// TestDecodeActionData_FrozenOpcode checks bare OP_2 — the dxs locking
+// builder's compact "frozen empty UTXO" encoding.
 func TestDecodeActionData_FrozenOpcode(t *testing.T) {
-	kind, frozen, _ := decodeActionData(nil, op2)
+	kind, frozen, _, _ := decodeActionData(nil, op2)
 	if kind != ActionKindFrozen {
 		t.Errorf("OP_2 should be frozen, got %s", kind)
 	}
@@ -137,7 +141,7 @@ func TestDecodeActionData_Swap(t *testing.T) {
 	binary.LittleEndian.PutUint32(rate[4:8], 1)
 	payload = append(payload, rate...)
 
-	kind, frozen, swap := decodeActionData(payload, 0)
+	kind, frozen, swap, _ := decodeActionData(payload, 0)
 	if kind != ActionKindSwap {
 		t.Errorf("expected swap, got %s", kind)
 	}
@@ -168,35 +172,77 @@ func TestDecodeActionData_SwapWithChainedNext(t *testing.T) {
 	// Append one more byte to simulate a chained-next prefix.
 	payload = append(payload, 0x01)
 
-	_, _, swap := decodeActionData(payload, 0)
+	_, _, swap, _ := decodeActionData(payload, 0)
 	if swap == nil || !swap.HasNext {
 		t.Errorf("HasNext should be true when bytes trail first leg")
 	}
 }
 
-// TestDecodeActionData_FrozenWithSwap covers the frozen-prefix-wrapping-
-// a-swap case (frozen swap-marked UTXO).
-func TestDecodeActionData_FrozenWithSwap(t *testing.T) {
-	innerSwap := append([]byte{actionSelectorSwap}, bytes.Repeat([]byte{0xcc}, swapLegBodySize)...)
-	payload := append([]byte{actionSelectorFrozen}, innerSwap...)
+// TestDecodeActionData_Confiscation covers selector 0x02 — the dxs
+// canonical "confiscation action record" kind. Payload bytes after the
+// selector must be preserved for SDK-specific decoding.
+func TestDecodeActionData_Confiscation(t *testing.T) {
+	innerPayload := []byte{0xaa, 0xbb, 0xcc}
+	payload := append([]byte{actionSelectorConfiscation}, innerPayload...)
 
-	kind, frozen, swap := decodeActionData(payload, 0)
-	if kind != ActionKindFrozen {
-		t.Errorf("frozen-wrapping kind label should win, got %s", kind)
+	kind, frozen, swap, recordPayload := decodeActionData(payload, 0)
+	if kind != ActionKindConfiscation {
+		t.Errorf("selector 0x02 should be confiscation per dxs canonical, got %s", kind)
 	}
-	if !frozen {
-		t.Errorf("must report frozen=true")
+	if frozen {
+		t.Errorf("confiscation action records must NOT set frozen=true (frozen is the bare-OP_2 state marker only)")
 	}
-	if swap == nil {
-		t.Errorf("inner swap descriptor should still be surfaced")
+	if swap != nil {
+		t.Errorf("confiscation should not surface a swap descriptor")
+	}
+	if !bytes.Equal(recordPayload, innerPayload) {
+		t.Errorf("payload preservation mismatch: got %x want %x", recordPayload, innerPayload)
+	}
+}
+
+// TestDecodeActionData_Freeze covers selector 0x03 — the dxs canonical
+// "freeze action record" kind. Previously labeled "custom" with payload
+// discarded; that was the validation bug Quaakee/dxs swarm caught.
+func TestDecodeActionData_Freeze(t *testing.T) {
+	innerPayload := []byte{0xde, 0xad}
+	payload := append([]byte{actionSelectorFreeze}, innerPayload...)
+
+	kind, _, _, recordPayload := decodeActionData(payload, 0)
+	if kind != ActionKindFreeze {
+		t.Errorf("selector 0x03 should be freeze per dxs canonical, got %s", kind)
+	}
+	if !bytes.Equal(recordPayload, innerPayload) {
+		t.Errorf("freeze payload preservation mismatch: got %x want %x", recordPayload, innerPayload)
 	}
 }
 
 // TestDecodeActionData_Custom covers the unknown-selector fallback.
+// Payload bytes (including the selector) must be preserved verbatim,
+// matching dxs's `{ kind: "unknown", action, payload }` semantics.
 func TestDecodeActionData_Custom(t *testing.T) {
-	kind, _, _ := decodeActionData([]byte{0xff, 0xab, 0xcd}, 0)
+	input := []byte{0xff, 0xab, 0xcd}
+	kind, _, _, payload := decodeActionData(input, 0)
 	if kind != ActionKindCustom {
 		t.Errorf("expected custom kind, got %s", kind)
+	}
+	if !bytes.Equal(payload, input) {
+		t.Errorf("custom payload should preserve the entire input verbatim; got %x want %x", payload, input)
+	}
+}
+
+// TestDecodeActionData_TruncatedSwap returns custom + raw payload when a
+// swap selector is followed by fewer than 60 body bytes.
+func TestDecodeActionData_TruncatedSwap(t *testing.T) {
+	input := []byte{actionSelectorSwap, 0xab, 0xcd}
+	kind, _, swap, payload := decodeActionData(input, 0)
+	if kind != ActionKindCustom {
+		t.Errorf("truncated swap should be reported as custom, got %s", kind)
+	}
+	if swap != nil {
+		t.Errorf("truncated swap should not surface a descriptor")
+	}
+	if !bytes.Equal(payload, input) {
+		t.Errorf("truncated swap should preserve raw payload")
 	}
 }
 
@@ -216,15 +262,30 @@ func TestSwapCancelSentinel(t *testing.T) {
 }
 
 // TestArbitratorFreeSentinel covers the EMPTY_HASH160 detection.
+//
+// The Rust SDK's arbitrator-free sentinel is HASH160("") =
+// `b472a266d0bd89c13706a4132ccfb16f7c3b9fcb`, NOT 20 zero bytes — that
+// was a bug the dxs validation swarm caught.
 func TestArbitratorFreeSentinel(t *testing.T) {
-	zeros := strings.Repeat("00", 20)
-	d := &SwapDescriptor{RequestedPkh: zeros}
+	d := &SwapDescriptor{RequestedPkh: EmptyHash160Hex}
 	if !IsArbitratorFreeDescriptor(d) {
-		t.Errorf("zero PKH should be arbitrator-free")
+		t.Errorf("HASH160('') sentinel should be arbitrator-free")
 	}
-	d2 := &SwapDescriptor{RequestedPkh: strings.Repeat("aa", 20)}
+
+	// 20 zero bytes is NOT the Rust SDK sentinel — must NOT match.
+	zeros := strings.Repeat("00", 20)
+	d2 := &SwapDescriptor{RequestedPkh: zeros}
 	if IsArbitratorFreeDescriptor(d2) {
+		t.Errorf("20-zero-bytes is NOT the canonical sentinel; helper must not match it")
+	}
+
+	d3 := &SwapDescriptor{RequestedPkh: strings.Repeat("aa", 20)}
+	if IsArbitratorFreeDescriptor(d3) {
 		t.Errorf("non-zero PKH should not be arbitrator-free")
+	}
+
+	if IsArbitratorFreeDescriptor(nil) {
+		t.Errorf("nil descriptor should not match")
 	}
 }
 
