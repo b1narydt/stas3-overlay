@@ -19,6 +19,10 @@ func main() {
 	mongoURL := os.Getenv("MONGO_URL")
 	sqlDB := envOr("SQL_DB", "./data.db")
 	port := envInt("SERVER_PORT", 8080)
+	// Optional per-class scope. Hex32 sha256 of the locking-script tail
+	// for the asset class this instance serves. Unset → admit every
+	// STAS v3 output (legacy default).
+	classHash := os.Getenv("STAS3_CLASS_HASH")
 
 	if privKey == "" {
 		slog.Error("SERVER_PRIVATE_KEY is required")
@@ -39,7 +43,7 @@ func main() {
 	srv.ConfigureMongoDB(mongoURL)
 
 	// Register STAS v3 topic manager and lookup service.
-	srv.ConfigureTopicManager(stas3.TopicName, stas3.NewTopicManager())
+	srv.ConfigureTopicManager(stas3.TopicName, stas3.NewClassScopedTopicManager(classHash))
 	lookupSvc := stas3.NewLookupService(srv.MongoDB)
 	srv.ConfigureLookupService(stas3.LookupServiceName, lookupSvc)
 
@@ -62,9 +66,15 @@ func main() {
 	srv.ConfigureGASPSync(true)
 	srv.ConfigureEngine(true)
 
+	scopeMode := "admit-all"
+	if classHash != "" {
+		scopeMode = "class-scoped"
+	}
 	slog.Info("starting stas3-overlay",
 		"port", port,
 		"hosting_url", hostURL,
+		"scope", scopeMode,
+		"class_hash", classHash,
 	)
 
 	if err := srv.Start(); err != nil {

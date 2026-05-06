@@ -1,6 +1,7 @@
 package stas3
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -22,22 +23,61 @@ const (
 )
 
 // STASOutput holds the parsed fields from a STAS v3 locking script.
+//
+// Every standard STAS3 wire field is surfaced here. `OptionalData` is left
+// as raw byte pushes — apps interpret them per their own scheme (e.g. EAC1,
+// VPPA, certificate-reference, etc.) or wait for a future schema layer
+// that decodes them into typed columns.
 type STASOutput struct {
-	// Address is the 20-byte owner/recipient hash160 (hex-encoded).
+	// Address is the 20-byte owner/recipient hash160 (hex-encoded). For
+	// DSTAS pubkey owners (33-byte push) this is the raw pubkey hex.
 	Address string
 	// TokenID is the 20-byte redemption PKH / token identifier (hex-encoded).
 	TokenID string
-	// Symbol is the optional token symbol (from optional data or legacy OP_RETURN field).
+	// Symbol is the optional token symbol from the legacy OP_RETURN
+	// second push. DSTAS does not encode symbol in the locking script —
+	// it lives in the off-chain contract OP_RETURN scheme JSON.
 	Symbol string
 	// IsDSTAS is true if the script uses the DSTAS direct-push-owner format.
 	IsDSTAS bool
+	// ClassHash is the universal asset-class identifier (sha256 of the
+	// script tail with owner + action_data stripped). See class_hash.go.
+	// Hex-encoded. Apps doing cross-class matching key on this value.
+	ClassHash string
+	// ActionKind classifies the action_data slot — one of "passive",
+	// "frozen", "swap", "custom". See action_data.go for the wire format.
+	ActionKind string
+	// Frozen is true for frozen-state action_data (selector 0x02 or
+	// bare OP_2). A frozen UTXO can still carry an inner swap descriptor.
+	Frozen bool
+	// ActionData is the raw push bytes (hex). Apps that need more than
+	// the typed fields above can re-decode from here.
+	ActionData string
+	// SwapDescriptor is set when ActionKind == "swap".
+	SwapDescriptor *SwapDescriptor
+	// ActionRecordPayload is the bytes after the selector for
+	// confiscation / freeze / custom action records (hex-encoded). Empty
+	// for swap and passive/frozen-empty kinds. Apps decode these
+	// SDK-defined inner structures themselves.
+	ActionRecordPayload string
+	// Flags is the protocol flag byte (bit 0 = freezable, bit 1 = confiscatable).
+	Flags uint8
+	// FreezeAuthority is the 20-byte hash160 of the freeze authority
+	// PKH (or MPKH). Empty unless Flags & 0x01 (freezable) is set.
+	FreezeAuthority string
+	// ConfiscationAuthority is the 20-byte hash160 of the confiscation
+	// authority PKH. Empty unless Flags & 0x02 (confiscatable) is set.
+	ConfiscationAuthority string
+	// OptionalData is the array of pushdata blobs that follow the
+	// service fields (hex-encoded). Layout is application-defined.
+	OptionalData []string
 }
 
 var (
-	ErrNotSTAS     = errors.New("not a STAS v3 script")
-	ErrTooShort    = errors.New("script too short for STAS v3")
-	ErrNoOpReturn  = errors.New("no OP_RETURN found")
-	ErrNoTokenID   = errors.New("no tokenId after OP_RETURN")
+	ErrNotSTAS    = errors.New("not a STAS v3 script")
+	ErrTooShort   = errors.New("script too short for STAS v3")
+	ErrNoOpReturn = errors.New("no OP_RETURN found")
+	ErrNoTokenID  = errors.New("no tokenId after OP_RETURN")
 )
 
 // ParseSTASScript attempts to parse a locking script as STAS v3.
@@ -45,11 +85,11 @@ var (
 //
 // DSTAS format:
 //
-//	[0x14 | 0x21] {owner bytes} {action data} {template...} 0x6a {20-byte redemption PKH} {flags} ...
+//	[0x14 | 0x21] {owner bytes} {action data} {template...} 0x6a {20-byte redemption PKH} {flags} {service fields...} {optional data...}
 //
 // Legacy P2PKH format:
 //
-//	76 a9 14 {20-byte hash160} 88 ac {covenant...} 6a {20-byte tokenId} ...
+//	76 a9 14 {20-byte hash160} 88 ac {covenant...} 6a {20-byte tokenId} [symbol]
 func ParseSTASScript(s *script.Script) (*STASOutput, error) {
 	if s == nil {
 		return nil, ErrNotSTAS
@@ -61,12 +101,36 @@ func ParseSTASScript(s *script.Script) (*STASOutput, error) {
 	}
 
 	// Try DSTAS format first (more common for STAS v3 / DXS SDK tokens).
-	if out, err := parseDSTAS(b); err == nil {
-		return out, nil
+	out, err := parseDSTAS(b)
+	if err != nil {
+		// Fall back to legacy P2PKH-style STAS.
+		out, err = parseLegacySTAS(b)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// Fall back to legacy P2PKH-style STAS.
-	return parseLegacySTAS(b)
+	// Class hash is the same computation for both layouts: sha256 of the
+	// script tail with the first two pushes (owner + action_data) stripped.
+	// For legacy STAS the "owner push" is the 5-byte P2PKH prefix; the
+	// existing extract helper is push-aware so it Just Works.
+	if classHash, hashErr := computeClassHashBytes(b); hashErr == nil {
+		out.ClassHash = classHash
+	}
+
+	return out, nil
+}
+
+// computeClassHashBytes is the byte-slice variant of ComputeClassHash.
+// Both share extractCounterpartyScript so the hash is byte-stable across
+// callers.
+func computeClassHashBytes(b []byte) (string, error) {
+	tail, err := extractCounterpartyScript(b)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(tail)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // parseDSTAS detects the DSTAS direct-push-owner locking script format.
@@ -98,7 +162,7 @@ func parseDSTAS(b []byte) (*STASOutput, error) {
 		addressHex = hex.EncodeToString(b[1:34])
 	}
 
-	// Skip action data field (second push: OP_0, OP_2, or data push).
+	// Decode action data (second push: OP_0, OP_2, or data push).
 	actionStart := ownerEnd
 	if actionStart >= len(b) {
 		return nil, ErrTooShort
@@ -108,6 +172,8 @@ func parseDSTAS(b []byte) (*STASOutput, error) {
 	if actionEnd < 0 || actionEnd >= len(b) {
 		return nil, ErrNotSTAS
 	}
+	actionPayload := extractPushPayload(b, actionStart, actionEnd)
+	actionKind, frozen, swap, actionRecordPayload := decodeActionData(actionPayload, actionByte)
 
 	// Verify there's a covenant body between action data and OP_RETURN.
 	// The DSTAS template base is substantial (hundreds of bytes).
@@ -128,7 +194,8 @@ func parseDSTAS(b []byte) (*STASOutput, error) {
 		return nil, ErrNotSTAS
 	}
 
-	// After OP_RETURN: parse data pushes to extract redemption PKH (= tokenId).
+	// After OP_RETURN: parse data pushes. Layout is
+	//   [redemption_pkh:20B] [flags:1B] [service_fields × popcount(flags & 3)] [optional_data...]
 	pushes, err := parseDataPushes(b[opReturnIdx+1:])
 	if err != nil {
 		return nil, fmt.Errorf("parsing post-OP_RETURN data: %w", err)
@@ -138,18 +205,75 @@ func parseDSTAS(b []byte) (*STASOutput, error) {
 	}
 
 	out := &STASOutput{
-		Address: addressHex,
-		TokenID: hex.EncodeToString(pushes[0]),
-		IsDSTAS: true,
+		Address:        addressHex,
+		TokenID:        hex.EncodeToString(pushes[0]),
+		IsDSTAS:        true,
+		ActionKind:     actionKind,
+		Frozen:         frozen,
+		ActionData:     hex.EncodeToString(actionPayload),
+		SwapDescriptor: swap,
+	}
+	if len(actionRecordPayload) > 0 {
+		out.ActionRecordPayload = hex.EncodeToString(actionRecordPayload)
 	}
 
-	// Check for symbol in optional data. In DSTAS, post-OP_RETURN pushes are:
-	// [redemptionPkh] [flags] [serviceField...] [optionalData...]
-	// There's no standard symbol field, but the action data byte 0x00 vs 0x52
-	// tells us frozen status if needed.
-	_ = actionByte // used above for skip; frozen detection can be added later
+	// Flags byte (push #2 after OP_RETURN). When absent, treat as 0
+	// (legacy DSTAS scripts may omit it; tail is still admittable).
+	if len(pushes) >= 2 && len(pushes[1]) == 1 {
+		out.Flags = pushes[1][0]
+	}
+
+	// Service fields follow the flags push, one per set bit in the low
+	// nibble. Bit 0 → freeze authority; bit 1 → confiscation authority.
+	// Service fields are 20-byte hash160 pushes.
+	serviceIdx := 2
+	if out.Flags&0x01 != 0 {
+		if serviceIdx < len(pushes) && len(pushes[serviceIdx]) == 20 {
+			out.FreezeAuthority = hex.EncodeToString(pushes[serviceIdx])
+		}
+		serviceIdx++
+	}
+	if out.Flags&0x02 != 0 {
+		if serviceIdx < len(pushes) && len(pushes[serviceIdx]) == 20 {
+			out.ConfiscationAuthority = hex.EncodeToString(pushes[serviceIdx])
+		}
+		serviceIdx++
+	}
+
+	// Optional data: everything after the service fields. Apps decode
+	// these per their own scheme (EAC1, certificate refs, etc.).
+	if serviceIdx < len(pushes) {
+		out.OptionalData = make([]string, 0, len(pushes)-serviceIdx)
+		for _, p := range pushes[serviceIdx:] {
+			out.OptionalData = append(out.OptionalData, hex.EncodeToString(p))
+		}
+	}
 
 	return out, nil
+}
+
+// extractPushPayload returns the data bytes pushed by the push operation
+// at b[start..end]. For single-byte opcodes (OP_0, OP_1..OP_16) this is
+// an empty slice. Used to feed action_data into decodeActionData.
+func extractPushPayload(b []byte, start, end int) []byte {
+	if start >= end || start >= len(b) {
+		return nil
+	}
+	op := b[start]
+	switch {
+	case op == 0x00 || (op >= 0x4f && op <= 0x60):
+		// Bare opcode — no payload bytes.
+		return nil
+	case op >= 0x01 && op <= 0x4b:
+		return b[start+1 : end]
+	case op == 0x4c: // OP_PUSHDATA1
+		return b[start+2 : end]
+	case op == 0x4d: // OP_PUSHDATA2
+		return b[start+3 : end]
+	case op == 0x4e: // OP_PUSHDATA4
+		return b[start+5 : end]
+	}
+	return nil
 }
 
 // parseLegacySTAS detects the P2PKH-prefix STAS locking script format.
