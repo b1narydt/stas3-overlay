@@ -1,0 +1,24 @@
+services:
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  stas3-overlay:
+    build: .
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    environment:
+      - SERVER_PRIVATE_KEY=${SERVER_PRIVATE_KEY}
+      - HOSTING_URL=${HOSTING_URL}
+      - MONGO_URL=mongodb://mongodb:27017/stas3
+      - SERVER_PORT=8080
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - ARC_API_KEY=${ARC_API_KEY:-}
+    depends_on:
+      - mongodb
+
+volumes:
+  mongo-data:
