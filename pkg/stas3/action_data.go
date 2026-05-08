@@ -54,10 +54,15 @@ type SwapDescriptor struct {
 	// matching compare this against any candidate UTXO's class_hash.
 	RequestedScriptHash string `bson:"requestedScriptHash" json:"requestedScriptHash"`
 	// RequestedPkh is the 20-byte hash160 the maker wants the
-	// counterparty asset delivered to. The Rust-SDK sentinel value
+	// counterparty asset delivered to. The sentinel value
 	// [EmptyHash160Hex] = `HASH160("")` flags the offer as
 	// "anyone-can-fill" (the engine accepts OP_FALSE on the maker's
-	// leg). dxs canonical does not define an arbitrator-free sentinel.
+	// leg) — a stas3-rs extension introduced in v0.2.0+ to support
+	// arbitrator-free swap offers emitted by Runar covenant contracts
+	// that hold no private key. dxs canonical does not emit this
+	// sentinel, but the on-chain wire format is identical and overlays
+	// indexing offers from either SDK can flag arbitrator-free entries
+	// via [IsArbitratorFreeDescriptor].
 	RequestedPkh string `bson:"requestedPkh"        json:"requestedPkh"`
 	// RateNumerator and RateDenominator express the trade ratio as a
 	// fraction. (0, 0) is the swap-cancel sentinel.
