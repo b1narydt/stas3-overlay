@@ -124,19 +124,32 @@ type STASQuery struct {
 }
 
 // TopicManagerMetaData returns overlay metadata for tm_stas3.
+//
+// Wire-format compatible with the canonical dxs-bsv-token-sdk and with
+// stas3-rs v0.2.0+ (https://github.com/b1narydt/stas3-rs). Both SDKs emit
+// STAS-3 outputs whose locking scripts this overlay parses byte-for-byte.
 func TopicManagerMetaData() *overlay.MetaData {
 	return &overlay.MetaData{
 		Name:        TopicName,
-		Description: "STAS v3 token overlay — admits outputs with valid STAS v3 locking scripts. Set STAS3_CLASS_HASH to scope to a single asset class.",
+		Description: "STAS v3 token overlay — admits outputs with valid STAS v3 locking scripts. Wire-format compatible with dxs-bsv-token-sdk and stas3-rs v0.2.0+. Set STAS3_CLASS_HASH to scope to a single asset class.",
 		Version:     "1.1.0",
 	}
 }
 
 // LookupServiceMetaData returns overlay metadata for ls_stas3.
+//
+// Query shape is documented in [STASQuery]. Class-scoped queries
+// (`classHash` filter, `swapRequestedScriptHash` for cross-class swap
+// discovery) match stas3-rs's `ClassHash` newtype byte-for-byte —
+// stas3-rs callers can use `class_hash.to_hex()` directly as the filter
+// value.
+//
+// stas3-rs ClassHash source:
+// https://github.com/b1narydt/stas3-rs/blob/main/src/primitives.rs
 func LookupServiceMetaData() *overlay.MetaData {
 	return &overlay.MetaData{
 		Name:        LookupServiceName,
-		Description: "STAS v3 token lookup — supports filters by tokenId, address, classHash, actionKind, swapRequestedScriptHash, frozenOnly, txid+vout, plus the legacy unspentOnly/spent flag.",
+		Description: "STAS v3 token lookup — supports filters by tokenId, address, classHash, actionKind, swapRequestedScriptHash, frozenOnly, txid+vout, plus the legacy unspentOnly/spent flag. Wire-format compatible with dxs-bsv-token-sdk and stas3-rs v0.2.0+.",
 		Version:     "1.1.0",
 	}
 }
